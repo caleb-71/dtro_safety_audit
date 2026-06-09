@@ -1,0 +1,23 @@
+# 가상환경
+.venv/
+
+# 데이터 파일 (용량 크고 보안 중요)
+data/raw/
+data/processed/
+data/vector_db/
+
+# 결과물
+output_files/
+
+# 임시 파일
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PyCharm 설정
+.idea/
+
+# 환경변수
+.env

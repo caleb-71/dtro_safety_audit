@@ -1,0 +1,8 @@
+ollama
+pandas
+openpyxl
+chromadb
+matplotlib
+seaborn
+python-docx
+tqdm
