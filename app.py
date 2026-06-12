@@ -33,6 +33,7 @@ with st.sidebar:
             "📄 보고서 생성",
             "💬 AI 질의응답",       # ← 신규
             "📋 현장 심사 도우미",   # ← 신규
+            "⚖️ 법령/규정 관리",  # ← 신규
         ],
         label_visibility="collapsed"
     )
@@ -68,4 +69,8 @@ elif menu == "💬 AI 질의응답":        # ← 신규
 
 elif menu == "📋 현장 심사 도우미":   # ← 신규
     from pages.page_field import render
+    render()
+
+elif menu == "⚖️ 법령/규정 관리":
+    from pages.page_legal import render
     render()

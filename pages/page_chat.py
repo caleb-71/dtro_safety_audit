@@ -12,6 +12,9 @@ import ollama
 import pandas as pd
 import streamlit as st
 
+from core.legal_engine import quick_legal_search
+from data.legal_store import get_legal_store_status
+
 from config.settings import (
     OLLAMA_MODEL, PROCESSED_DIR, OUTPUT_DIR
 )
@@ -211,46 +214,65 @@ def _render_input_area(df: pd.DataFrame | None):
 # AI 응답 생성 (핵심)
 # ─────────────────────────────────────────
 def _generate_answer(question: str, df: pd.DataFrame) -> str:
-    """
-    질문 유형을 판단하고 적절한 방식으로 답변 생성
-    1. 데이터 조회형  → pandas 직접 분석
-    2. 유사사례형     → RAG 검색
-    3. 분석/예측형    → LLM + 데이터 컨텍스트
-    """
     try:
-        # ── 데이터 컨텍스트 구성
+        # 법령 관련 질문 감지
+        legal_keywords = [
+            "법령", "법률", "규정", "조항", "제○조", "근거",
+            "위반", "가이드", "SOP", "절차서", "지침"
+        ]
+        is_legal_query = any(kw in question for kw in legal_keywords)
+
+        # 법령DB 상태 확인
+        legal_status = get_legal_store_status()
+
+        # 법령 관련 질문이고 DB가 구축된 경우
+        if is_legal_query and legal_status["ready"]:
+            with st.spinner("법령 검색 중..."):
+                legal_answer = quick_legal_search(question)
+            return f"⚖️ **법령/규정 기반 답변**\n\n{legal_answer}"
+
+        # 일반 데이터 질의
         context = _build_data_context(question, df)
 
-        # ── 대화 히스토리 (최근 5개)
-        history = st.session_state.get("chat_messages", [])[-5:]
-        messages = []
-        for h in history:
-            messages.append({
-                "role":    h["role"],
-                "content": h["content"]
-            })
+        # 법령DB가 있으면 추가 검색
+        legal_context = ""
+        if legal_status["ready"]:
+            from data.legal_store import search_legal
+            legal_results = search_legal(question, top_k=2)
+            if legal_results:
+                legal_parts = []
+                for r in legal_results:
+                    meta = r.get("metadata", {})
+                    legal_parts.append(
+                        f"- {meta.get('file_stem','')} "
+                        f"({meta.get('category_ko','')}): "
+                        f"{r.get('text','')[:200]}"
+                    )
+                legal_context = (
+                    "\n\n[관련 법령/규정]\n"
+                    + "\n".join(legal_parts)
+                )
 
-        # ── 시스템 프롬프트
+        history  = st.session_state.get("chat_messages", [])[-5:]
+        messages = [
+            {"role": h["role"], "content": h["content"]}
+            for h in history
+        ]
+
         system_prompt = f"""당신은 대구도시철도공사(DTRO) 자체종합안전심사 전문 AI 어시스턴트입니다.
-철도안전관리체계에 따른 심사 이력 데이터를 분석하여 정확하고 유용한 답변을 제공합니다.
 
 [현재 데이터 현황]
-{context}
+{context}{legal_context}
 
 [답변 원칙]
 1. 데이터에 근거한 사실만 답변합니다
 2. 건수, 비율 등 숫자는 정확하게 제시합니다
 3. 한국어로 명확하고 간결하게 답변합니다
 4. 표나 목록 형식으로 가독성을 높입니다
-5. 심사 담당자가 실무에 바로 활용할 수 있도록 합니다"""
+5. 법령 근거가 있으면 반드시 인용합니다"""
 
-        # ── 현재 질문 추가
-        messages.append({
-            "role":    "user",
-            "content": question
-        })
+        messages.append({"role": "user", "content": question})
 
-        # ── LLM 호출
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
@@ -259,12 +281,11 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
             ],
             options={"temperature": 0.3}
         )
-
         return response["message"]["content"]
 
     except Exception as e:
         logger.error(f"AI 응답 오류: {e}")
-        return f"❌ 오류가 발생했습니다: {e}\n\nOllama가 실행 중인지 확인해주세요."
+        return f"❌ 오류: {e}"
 
 
 # ─────────────────────────────────────────
