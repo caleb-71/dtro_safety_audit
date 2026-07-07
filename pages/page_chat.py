@@ -215,46 +215,87 @@ def _render_input_area(df: pd.DataFrame | None):
 # ─────────────────────────────────────────
 def _generate_answer(question: str, df: pd.DataFrame) -> str:
     try:
-        # 법령 관련 질문 감지
+        # ── 법령DB 상태 먼저 확인 ──
+        legal_status = get_legal_store_status()
+
+        # ── 법령 관련 질문 감지 ──
+        # 기존 키워드 방식의 한계:
+        # "MSDS 갱신주기?" 같은 질문은 법령 키워드가 없어서 건너뜀
+        # → 해결: 법령DB 가 있으면 무조건 검색하고,
+        #          유사도가 높은 결과가 있을 때만 법령 우선 답변
         legal_keywords = [
             "법령", "법률", "규정", "조항", "제○조", "근거",
-            "위반", "가이드", "SOP", "절차서", "지침"
+            "위반", "가이드", "SOP", "절차서", "지침",
+            # ── 추가: 주기/기준 관련 질문 키워드 ──
+            "주기", "기간", "기준", "몇 년", "몇년", "얼마나",
+            "언제", "몇 회", "몇회", "횟수", "의무", "해야",
+            "MSDS", "물질안전보건자료", "화학물질",
+            "점검", "교육", "훈련", "갱신", "업데이트",
         ]
         is_legal_query = any(kw in question for kw in legal_keywords)
 
-        # 법령DB 상태 확인
-        legal_status = get_legal_store_status()
+        # ── 법령 우선 검색 (핵심 변경) ──
+        # 기존: is_legal_query 일 때만 법령DB 검색
+        # 변경: 법령DB 가 있으면 항상 검색하고,
+        #        유사도 0.5 이상 결과가 있으면 법령 우선 답변
+        #        (키워드 감지 누락으로 인한 오답 방지)
+        if legal_status["ready"]:
+            from data.legal_store import search_legal
+            # top_k=5 로 충분히 검색 (기존 2 → 5 로 증가)
+            legal_results = search_legal(question, top_k=5)
 
-        # 법령 관련 질문이고 DB가 구축된 경우
-        if is_legal_query and legal_status["ready"]:
-            with st.spinner("법령 검색 중..."):
-                legal_answer = quick_legal_search(question)
-            return f"⚖️ **법령/규정 기반 답변**\n\n{legal_answer}"
+            # 유사도 0.5 이상 결과가 있으면 법령 우선 답변
+            # (0.5 미만은 관련성 낮은 것으로 판단)
+            high_sim_results = [
+                r for r in legal_results
+                if r.get("similarity", 0) >= 0.5
+            ]
 
-        # 일반 데이터 질의
+            if high_sim_results or is_legal_query:
+                with st.spinner("법령/규정 검색 중..."):
+                    legal_answer = quick_legal_search(question, top_k=5)
+
+                # 법령DB 에서 찾은 경우 출처 명시
+                if high_sim_results:
+                    sources = list({
+                        r["metadata"].get("file_stem", "")
+                        for r in high_sim_results
+                        if r.get("metadata", {}).get("file_stem")
+                    })
+                    source_str = ", ".join(sources)
+                    return (
+                        f"⚖️ **법령/규정 기반 답변** "
+                        f"*(참고문서: {source_str})*\n\n"
+                        f"{legal_answer}\n\n"
+                        f"---\n"
+                        f"📌 위 답변은 등록된 법령/규정 문서에서 검색한 내용입니다."
+                    )
+                else:
+                    return f"⚖️ **법령/규정 기반 답변**\n\n{legal_answer}"
+
+        # ── 법령DB 에서 못 찾은 경우 — 일반 데이터 질의 ──
         context = _build_data_context(question, df)
 
-        # 법령DB가 있으면 추가 검색
+        # 법령DB 보조 검색 (낮은 유사도라도 힌트로 활용)
         legal_context = ""
         if legal_status["ready"]:
             from data.legal_store import search_legal
-            legal_results = search_legal(question, top_k=2)
+            legal_results = search_legal(question, top_k=3)
             if legal_results:
                 legal_parts = []
                 for r in legal_results:
                     meta = r.get("metadata", {})
+                    sim  = r.get("similarity", 0)
                     legal_parts.append(
                         f"- {meta.get('file_stem','')} "
-                        f"({meta.get('category_ko','')}): "
+                        f"({meta.get('category_ko','')}, 관련도 {sim:.0%}): "
                         f"{r.get('text','')[:200]}"
                     )
                 legal_context = (
-                    "\n\n[관련 법령/규정]\n"
+                    "\n\n[관련 법령/규정 (참고)]\n"
                     + "\n".join(legal_parts)
                 )
 
-        # 직전 대화 이력 (마지막 항목은 방금 저장된 '현재 질문'이므로 제외 —
-        # 아래에서 question 을 다시 붙이기 때문에 포함하면 중복 전달됨)
         history  = st.session_state.get("chat_messages", [])[:-1][-5:]
         messages = [
             {"role": h["role"], "content": h["content"]}
@@ -271,7 +312,23 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
 2. 건수, 비율 등 숫자는 정확하게 제시합니다
 3. 한국어로 명확하고 간결하게 답변합니다
 4. 표나 목록 형식으로 가독성을 높입니다
-5. 법령 근거가 있으면 반드시 인용합니다"""
+5. 법령 근거가 있으면 반드시 인용합니다
+6. 법령/규정 자료에 명시된 내용과 AI 일반 지식이 다를 경우
+   반드시 법령/규정 자료의 내용을 우선합니다"""
+
+        # ── 경고 문구 추가 ──
+        # 법령DB 에서 근거를 찾지 못한 경우
+        # 사용자가 AI 자체 지식 기반 답변임을 인지할 수 있도록 표시
+        disclaimer = (
+            "\n\n---\n"
+            "⚠️ *이 답변은 등록된 법령/규정 문서에서 직접 근거를 찾지 못해 "
+            "AI 일반 지식을 바탕으로 한 것입니다. "
+            "주기, 기준, 의무사항 등 중요한 내용은 반드시 관련 지침서를 직접 확인하세요.*"
+        ) if not legal_status["ready"] else (
+            "\n\n---\n"
+            "⚠️ *법령/규정 문서에서 직접 근거를 찾지 못했습니다. "
+            "관련 지침서를 직접 확인하시기 바랍니다.*"
+        )
 
         messages.append({"role": "user", "content": question})
 
@@ -283,11 +340,12 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
             ],
             options={"temperature": 0.3}
         )
-        return response["message"]["content"]
+        return response["message"]["content"] + disclaimer
 
     except Exception as e:
         logger.error(f"AI 응답 오류: {e}")
         return f"❌ 오류: {e}"
+
 
 
 # ─────────────────────────────────────────
