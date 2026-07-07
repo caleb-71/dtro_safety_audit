@@ -3,7 +3,7 @@
 # 지적사항에 대한 법령 근거 자동 생성
 
 import logging
-import ollama
+from core.llm_client import llm_chat
 from config.settings import OLLAMA_MODEL
 from data.legal_store import search_legal
 
@@ -108,7 +108,7 @@ def _generate_basis_text(
 
 법령 근거:"""
 
-        response = ollama.chat(
+        response = llm_chat(
             model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.1}
@@ -178,7 +178,7 @@ def quick_legal_search(
 
 답변:"""
 
-        response = ollama.chat(
+        response = llm_chat(
             model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.1}

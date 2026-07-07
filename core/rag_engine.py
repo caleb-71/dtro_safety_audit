@@ -32,10 +32,12 @@ def initialize_rag(df: pd.DataFrame = None) -> bool:
     return build_vector_store(df)
 
 
-def classify_with_rag(row: pd.Series) -> dict:
+def classify_with_rag(row: pd.Series, repeat_count: int = 1) -> dict:
     """
     단일 행에 대해 RAG 기반 AI 분류 수행
     :param row: DataFrame 행
+    :param repeat_count: 같은 제목의 지적사항이 전체 데이터에서 반복된 횟수
+                         (3회 이상이면 classifier 가 리스크를 '상'으로 상향)
     :return: 분류 결과
     """
     title      = str(row.get("title", ""))
@@ -51,7 +53,8 @@ def classify_with_rag(row: pd.Series) -> dict:
         title=title,
         problem=problem,
         audit_type=audit_type,
-        similar_cases=similar_cases
+        similar_cases=similar_cases,
+        repeat_count=repeat_count,
     )
 
     return result
@@ -70,9 +73,18 @@ def run_full_classification(
     df = df.copy()
     total = len(df)
 
+    # ★ 버그 수정 (2026-07): 제목별 반복 횟수를 미리 계산해 분류기에 전달
+    # 기존에는 repeat_count 가 전달되지 않아 항상 기본값 1로 처리됐고,
+    # 그 결과 "반복 3회 이상 → 리스크 상" 규칙이 전혀 작동하지 않았음
+    title_counts = (
+        df["title"].value_counts().to_dict()
+        if "title" in df.columns else {}
+    )
+
     results = []
     for i, (idx, row) in enumerate(df.iterrows()):
-        result = classify_with_rag(row)
+        repeat_count = title_counts.get(str(row.get("title", "")), 1)
+        result = classify_with_rag(row, repeat_count=repeat_count)
         results.append(result)
 
         # Streamlit 진행률 업데이트

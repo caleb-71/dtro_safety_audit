@@ -8,6 +8,12 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from pathlib import Path
 from config.settings import PROCESSED_DIR
+from core.action_analyzer import (
+    add_action_status,
+    action_summary,
+    action_rate_by_group,
+    consulting_targets,
+)
 
 # ─────────────────────────────────────────
 # 한글 폰트 설정
@@ -52,6 +58,9 @@ def render():
     df = df[df["ai_part"].notna()]
     df = df[df["ai_part"] != "미분류"]
 
+    # 조치 이행상태 판정 컬럼 추가 (규칙 기반 — 즉시 처리)
+    df = add_action_status(df)
+
     # ─────────────────────────────────────
     # 필터 옵션
     # ─────────────────────────────────────
@@ -88,11 +97,12 @@ def render():
     # ─────────────────────────────────────
     # 탭 구성
     # ─────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 파트별 현황",
         "📅 연도별 트렌드",
         "⚠️ 리스크 분석",
-        "🔁 반복 지적 TOP"
+        "🔁 반복 지적 TOP",
+        "✅ 조치 이행실태"
     ])
 
     # ─────────────────────────────────
@@ -107,6 +117,9 @@ def render():
 
     with tab4:
         _render_repeat_analysis(df_filtered)
+
+    with tab5:
+        _render_action_analysis(df_filtered)
 
 
 # ─────────────────────────────────────────
@@ -356,6 +369,10 @@ def _render_repeat_analysis(df: pd.DataFrame):
 
     # 부서별 지적 빈도
     st.subheader("🏢 부서별 지적사항 빈도 TOP 10")
+    _render_dept_freq(df)
+
+
+def _render_dept_freq(df: pd.DataFrame):
     if "department" in df.columns:
         dept_counts = (
             df["department"]
@@ -377,3 +394,92 @@ def _render_repeat_analysis(df: pd.DataFrame):
         plt.tight_layout()
         st.pyplot(fig3)
         plt.close()
+
+
+# ─────────────────────────────────────────
+# Tab 5: 조치 이행실태 (신규, 2026-07)
+# ─────────────────────────────────────────
+def _render_action_analysis(df: pd.DataFrame):
+    """
+    추진실적 텍스트를 판정한 조치상태(완료/형식적/진행중/미확인)를 기반으로
+    전체 이행률, 부서별·파트별·연도별 이행률, 컨설팅 우선 대상을 표시합니다.
+    """
+    st.subheader("✅ 조치 이행실태 분석")
+    st.caption(
+        "추진실적 기록을 자동 판정한 결과입니다. "
+        "'형식적'은 \"조치완료\" 한 줄 등 내용 없는 완료 처리로, 실질 이행 확인이 필요합니다."
+    )
+
+    if "action_status" not in df.columns:
+        st.info("추진실적 데이터가 없습니다.")
+        return
+
+    # ── 전체 요약 KPI
+    summary = action_summary(df)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("📋 전체", f"{summary['total']}건")
+    col2.metric("✅ 완료", f"{summary['완료']}건")
+    col3.metric("📝 형식적 완료", f"{summary['형식적']}건",
+                delta="실질 확인 필요" if summary['형식적'] > 0 else None,
+                delta_color="inverse" if summary['형식적'] > 0 else "off")
+    col4.metric("🔄 진행중", f"{summary['진행중']}건")
+    col5.metric("❓ 미확인", f"{summary['미확인']}건")
+
+    st.metric("🎯 이행률 (완료 ÷ 전체)", f"{summary['이행률']}%")
+    st.markdown("---")
+
+    # ── 부서별 이행률 (이행률 낮은 순 — 컨설팅 우선 대상이 위)
+    st.markdown("#### 🏢 부서별 이행률 (낮은 순)")
+    dept_rate = action_rate_by_group(df, "department")
+    if not dept_rate.empty:
+        dept_rate_display = dept_rate.rename(columns={"department": "부서"})
+        st.dataframe(dept_rate_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("부서 데이터가 없습니다.")
+
+    # ── 파트별 / 연도별 이행률
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("#### 파트별 이행률")
+        part_rate = action_rate_by_group(df, "ai_part")
+        if not part_rate.empty:
+            st.dataframe(
+                part_rate.rename(columns={"ai_part": "파트"}),
+                use_container_width=True, hide_index=True
+            )
+    with col_b:
+        st.markdown("#### 연도별 이행률")
+        year_rate = action_rate_by_group(df, "year")
+        if not year_rate.empty:
+            st.dataframe(
+                year_rate.rename(columns={"year": "연도"}).sort_values("연도"),
+                use_container_width=True, hide_index=True
+            )
+
+    st.markdown("---")
+
+    # ── 컨설팅 우선 대상 부서
+    st.markdown("#### 🎯 컨설팅 우선 대상 부서")
+    st.caption("지적 3건 이상 + 이행률 60% 이하 부서 — 지적 감소 컨설팅이 가장 시급한 곳입니다.")
+    targets = consulting_targets(df)
+    if not targets.empty:
+        st.dataframe(
+            targets.rename(columns={"department": "부서"}),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.success("✅ 컨설팅 우선 대상 기준에 해당하는 부서가 없습니다.")
+
+    # ── 미확인/형식적 상세 목록
+    with st.expander("📝 형식적 완료 / 미확인 건 상세 보기"):
+        problem_df = df[df["action_status"].isin(["형식적", "미확인"])]
+        if problem_df.empty:
+            st.info("해당 건이 없습니다.")
+        else:
+            cols = [c for c in ["year", "department", "title", "action_result", "action_status"]
+                    if c in problem_df.columns]
+            show = problem_df[cols].rename(columns={
+                "year": "연도", "department": "부서", "title": "지적사항",
+                "action_result": "추진실적", "action_status": "조치상태",
+            })
+            st.dataframe(show, use_container_width=True, hide_index=True)

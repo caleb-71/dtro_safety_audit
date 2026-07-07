@@ -43,37 +43,76 @@ def get_or_create_collection() -> chromadb.Collection:
 # ─────────────────────────────────────────
 # 벡터화 텍스트 생성
 # ─────────────────────────────────────────
+
+# 형식적 완료 문구 목록 (벡터화 제외용)
+_TRIVIAL_RESULTS = {
+    "조치완료", "조치 완료", "이행완료", "이행 완료",
+    "시행완료", "시행 완료", "완료", "처리완료",
+    "해당없음", "해당 없음", "없음",
+}
+
 def _build_vector_text(row: pd.Series) -> str:
     """
     벡터화할 텍스트 생성
-    포함 컬럼: 제목, 현황및문제점, 개선방안, 추진실적
 
-    제외 컬럼 (메타데이터로만 활용):
-    순번, 심사년도, 관리번호, 세부번호, 심사구분, 담당부서
-    → 코드/숫자값이라 벡터화 시 노이즈
-    → ChromaDB 메타데이터로 저장해 필터 검색에 활용
+    ── 포함 컬럼 ──────────────────────────────────
+    [제목]      title         핵심 분류 기준       전체
+    [문제점]    problem       상세 내용            최대 300자
+    [개선방안]  improvement   해결책 패턴          최대 200자
+    [추진실적]  action_result 완료 패턴 학습       최대 150자
+                              (형식적 완료 문구 제외)
+    [관련근거]  legal_basis   법령명 → 분류 정확도 최대 100자 (신규)
+
+    ── 제외 컬럼 (메타데이터로만 활용) ────────────
+    Source.Name, attachment   → 분석 무관, 전처리 시 제거
+    seq, year, mgmt_no 등     → 숫자/코드값, 필터 검색에 활용
+    audit_type, department    → 메타데이터 필터 활용
+    action_plan, future_plan  → 미래 계획, 분류 무관
     """
+
+    def _is_trivial(text: str) -> bool:
+        """형식적 완료 문구 여부 — 20자 이하 + 완료 키워드 포함"""
+        if len(text) <= 20:
+            return any(p in text for p in _TRIVIAL_RESULTS)
+        return False
+
+    def _safe(val, max_len: int = 0) -> str:
+        """None/nan 제거 + 길이 제한"""
+        v = str(val).strip()
+        if v in ("nan", "None", "NaN", "내용 없음", "미기재"):
+            return ""
+        return v[:max_len] if max_len else v
+
     parts = []
 
-    # 제목
-    title = str(row.get("title", "")).strip()
-    if title and title != "nan":
+    # 제목 (전체 — 핵심 분류 기준)
+    title = _safe(row.get("title", ""))
+    if title:
         parts.append(f"[제목] {title}")
 
-    # 현황및문제점
-    problem = str(row.get("problem", "")).strip()
-    if problem and problem not in ("nan", "내용 없음"):
+    # 현황및문제점 (최대 300자)
+    problem = _safe(row.get("problem", ""), max_len=300)
+    if problem:
         parts.append(f"[문제점] {problem}")
 
-    # 개선방안
-    improvement = str(row.get("improvement", "")).strip()
-    if improvement and improvement not in ("nan", "내용 없음"):
+    # 개선방안 (최대 200자)
+    improvement = _safe(row.get("improvement", ""), max_len=200)
+    if improvement:
         parts.append(f"[개선방안] {improvement}")
 
-    # 추진실적 (완료/미완료 패턴 학습용)
-    action_result = str(row.get("action_result", "")).strip()
-    if action_result and action_result not in ("nan", "내용 없음"):
+    # 추진실적 (최대 150자, 형식적 완료 문구 제외)
+    # "조치완료" 같은 단순 문구는 노이즈 → 제외
+    # 구체적인 조치 내용이 있는 경우만 포함
+    action_result = _safe(row.get("action_result", ""), max_len=150)
+    if action_result and not _is_trivial(action_result):
         parts.append(f"[추진실적] {action_result}")
+
+    # 관련근거 (최대 100자, 신규 추가)
+    # 법령명이 벡터에 포함되면 법령 기반 파트 분류 정확도 향상
+    # 예) "산업안전보건기준에 관한 규칙 제133조" → 안전보건 분류에 기여
+    legal_basis = _safe(row.get("legal_basis", ""), max_len=100)
+    if legal_basis:
+        parts.append(f"[관련근거] {legal_basis}")
 
     return " | ".join(parts)
 
@@ -91,11 +130,13 @@ def _build_metadata(row: pd.Series) -> dict:
       → year="2025", audit_type="개선권고", department="전력팀"
     - "관리번호 106번 건 추적"
       → mgmt_no="106"
+    - "종합청사 전기실 지적사항 검색"
+      → location="종합청사 전기실"
     """
     def safe_str(val) -> str:
-        """None/nan/빈값을 빈 문자열로 변환"""
+        """None/nan/빈값/미기재를 빈 문자열로 변환"""
         v = str(val).strip()
-        return "" if v in ("nan", "None", "NaN") else v
+        return "" if v in ("nan", "None", "NaN", "미기재") else v
 
     return {
         # 기존 메타데이터
@@ -105,12 +146,14 @@ def _build_metadata(row: pd.Series) -> dict:
         "audit_type": safe_str(row.get("audit_type", "")),
         "ai_part":    safe_str(row.get("ai_part", "")),
 
-        # 추가 메타데이터
-        "seq":        safe_str(row.get("seq", "")),        # 순번
-        "mgmt_no":    safe_str(row.get("mgmt_no", "")),    # 관리번호
-        "detail_no":  safe_str(row.get("detail_no", "")),  # 세부번호
-    }
+        # 기존 추가 메타데이터
+        "seq":        safe_str(row.get("seq", "")),       # 순번
+        "mgmt_no":    safe_str(row.get("mgmt_no", "")),   # 관리번호
+        "detail_no":  safe_str(row.get("detail_no", "")), # 세부번호
 
+        # 신규 추가
+        "location":   safe_str(row.get("location", "")),  # 장소 (현장 검색용)
+    }
 
 # ─────────────────────────────────────────
 # 벡터DB 구축

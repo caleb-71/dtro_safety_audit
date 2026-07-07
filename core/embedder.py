@@ -1,6 +1,10 @@
 # core/embedder.py
 # 텍스트 임베딩 모듈 (nomic-embed-text 활용)
 # RAG 검색의 핵심 — 텍스트를 벡터로 변환
+#
+# ※ OLLAMA_MODE 와 무관하게 임베딩은 항상 로컬 Ollama 를 사용한다.
+#    사내망 AI 서버(/llm/model)는 채팅 전용이며 임베딩 API 가 없음.
+#    network 모드에서도 로컬에 nomic-embed-text 만 설치돼 있으면 RAG 동작.
 
 import logging
 import ollama

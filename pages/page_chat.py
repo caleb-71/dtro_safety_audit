@@ -8,10 +8,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import ollama
 import pandas as pd
 import streamlit as st
 
+from core.llm_client import llm_chat, llm_status
 from core.legal_engine import quick_legal_search
 from data.legal_store import get_legal_store_status
 
@@ -253,7 +253,9 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
                     + "\n".join(legal_parts)
                 )
 
-        history  = st.session_state.get("chat_messages", [])[-5:]
+        # 직전 대화 이력 (마지막 항목은 방금 저장된 '현재 질문'이므로 제외 —
+        # 아래에서 question 을 다시 붙이기 때문에 포함하면 중복 전달됨)
+        history  = st.session_state.get("chat_messages", [])[:-1][-5:]
         messages = [
             {"role": h["role"], "content": h["content"]}
             for h in history
@@ -273,7 +275,7 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
 
         messages.append({"role": "user", "content": question})
 
-        response = ollama.chat(
+        response = llm_chat(
             model=OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -433,6 +435,41 @@ def _extract_relevant_data(question: str, df: pd.DataFrame) -> str:
                 for i, (d, c) in enumerate(top_dept.items())
             )
             result_parts.append(f"부서별 지적 TOP10:\n{d_str}")
+
+    # 조치 이행실태 감지 (신규, 2026-07)
+    # "조치가 안 된 지적사항은?", "이행률 낮은 부서는?" 같은 질문 처리
+    if any(kw in question for kw in ["이행", "조치", "미조치", "완료율", "추진실적", "컨설팅"]):
+        try:
+            from core.action_analyzer import (
+                add_action_status, action_summary,
+                action_rate_by_group, consulting_targets,
+            )
+            df_act = add_action_status(df)
+            s = action_summary(df_act)
+            result_parts.append(
+                f"조치 이행실태: 전체 {s['total']}건 중 "
+                f"완료 {s['완료']}건, 형식적완료 {s['형식적']}건, "
+                f"진행중 {s['진행중']}건, 미확인 {s['미확인']}건 "
+                f"(이행률 {s['이행률']}%)"
+            )
+            dept_rate = action_rate_by_group(df_act, "department")
+            if not dept_rate.empty:
+                low5 = dept_rate.head(5)
+                r_str = "\n".join(
+                    f"  - {row['department']}: 이행률 {row['이행률(%)']}% "
+                    f"(지적 {row['지적건수']}건, 완료 {row['완료']}건)"
+                    for _, row in low5.iterrows()
+                )
+                result_parts.append(f"이행률 낮은 부서 TOP5:\n{r_str}")
+            targets = consulting_targets(df_act)
+            if not targets.empty:
+                t_str = ", ".join(
+                    f"{row['department']}({row['이행률(%)']}%)"
+                    for _, row in targets.iterrows()
+                )
+                result_parts.append(f"컨설팅 우선 대상 부서(지적 3건↑+이행률 60%↓): {t_str}")
+        except Exception:
+            pass
 
     return "\n".join(result_parts)
 

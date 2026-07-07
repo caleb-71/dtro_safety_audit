@@ -32,14 +32,30 @@ LEGAL_CATEGORIES = {
 # 법령 청크 설정
 LEGAL_CHUNK_SIZE    = 500   # 청크당 글자 수
 LEGAL_CHUNK_OVERLAP = 100   # 청크 간 겹치는 글자 수
-LEGAL_TOP_K         = 3     # 검색 시 반환할 결과 수
+LEGAL_TOP_K         = 8     # 검색 시 반환할 결과 수
 
 # ─────────────────────────────────────────
 # AI 모델 설정 (Ollama)
 # ─────────────────────────────────────────
+# ★ 여기만 변경하세요 ★
+OLLAMA_MODE = "network"    # "local" = 내 PC Ollama / "network" = 사내망 서버 AI
+
+# 공통
 OLLAMA_MODEL     = "llama3.1:8b"
 EMBEDDING_MODEL  = "nomic-embed-text"
 OLLAMA_TIMEOUT   = 120
+
+# 사내망 서버 AI 설정 (OLLAMA_MODE = "network" 일 때 사용)
+NETWORK_LLM_URL     = "http://172.16.101.180:8080"   # 사내망 AI 서버 주소
+NETWORK_LLM_MODEL   = "llama3.1:8b"                  # 서버에 설치된 모델명
+NETWORK_LLM_NUM_CTX = 4096                           # 컨텍스트 길이
+NETWORK_LLM_TIMEOUT = 300                            # 응답 대기 한도(초) — 긴 생성 대비
+NETWORK_LLM_SESSION = "dtro_audit"                   # 서버 세션 구분자
+
+# ※ 참고: 임베딩(벡터 검색용 nomic-embed-text)은 사내망 서버에 임베딩 API가
+#   없으므로 모드와 무관하게 항상 로컬 Ollama를 사용합니다. (CPU로도 충분히 빠름)
+#   network 모드에서 벡터 검색·RAG를 쓰려면 로컬 Ollama에
+#   nomic-embed-text 모델만 설치되어 있으면 됩니다: ollama pull nomic-embed-text
 
 # ─────────────────────────────────────────
 # 분류 파트 정의

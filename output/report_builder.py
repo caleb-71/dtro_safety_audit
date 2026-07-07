@@ -18,8 +18,65 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 from config.settings import OUTPUT_DIR
+from core.action_analyzer import (
+    add_action_status, action_summary,
+    action_rate_by_group, consulting_targets,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────
+# AI 서술 문단 생성 (신규, 2026-07)
+# ─────────────────────────────────────────
+def _generate_narrative(topic: str, stats_text: str) -> str:
+    """
+    집계된 통계 수치를 근거로 보고서용 분석 서술 문단을 LLM으로 생성합니다.
+
+    설계 원칙:
+    - 통계에 있는 수치만 인용하도록 프롬프트에 명시 (환각 억제)
+    - Ollama 미가동 등 오류 시 빈 문자열 반환 → 보고서 생성 자체는 계속됨
+      (AI 서술은 '있으면 좋은' 부가 요소이므로 실패가 전체를 막으면 안 됨)
+    """
+    try:
+        from core.llm_client import llm_chat
+        from config.settings import OLLAMA_MODEL
+
+        prompt = f"""당신은 대구교통공사 자체종합안전심사 결과보고서를 작성하는 안전관리 전문가입니다.
+아래 통계 데이터를 근거로 '{topic}'에 대한 분석 문단을 작성하세요.
+
+[통계 데이터]
+{stats_text}
+
+[작성 지침]
+1. 통계 데이터에 있는 수치만 정확히 인용하세요 (추측·과장 금지)
+2. 보고서 서술체로 3~5문장의 하나의 문단으로 작성하세요
+3. 수치 인용 후 안전관리 관점의 시사점을 1가지 포함하세요
+4. 제목이나 머리기호 없이 본문 문단만 작성하세요
+5. 한국어로 작성하세요"""
+
+        response = llm_chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.2},
+        )
+        return response["message"]["content"].strip()
+
+    except Exception as e:
+        logger.warning(f"AI 서술 생성 스킵 ({topic}): {e}")
+        return ""
+
+
+def _add_narrative(doc: Document, topic: str, stats_text: str):
+    """AI 서술 문단을 문서에 추가합니다. 생성 실패 시 조용히 건너뜁니다."""
+    text = _generate_narrative(topic, stats_text)
+    if not text:
+        return
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.font.size = Pt(10)
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after  = Pt(6)
 
 # ─────────────────────────────────────────
 # 색상 설정
@@ -70,26 +127,47 @@ def build_report(df: pd.DataFrame) -> Path:
     _set_korean_font()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ★ 수정 (2026-07): 연도 하드코딩 제거 — 데이터의 최신 연도 사용,
+    # 연도 데이터가 없으면 현재 연도로 대체
+    report_year = _get_report_year(df)
+
+    # 조치 이행상태 판정 컬럼 추가 (제6장 이행실태 분석에 사용)
+    df = add_action_status(df)
+
     doc = Document()
     _setup_document(doc)
 
-    _add_cover(doc)
+    _add_cover(doc, report_year)
     _add_toc(doc)
     _add_chapter_overview(doc, df)
     _add_chapter_classification(doc, df)
     _add_chapter_part_analysis(doc, df)
+    _add_chapter_dept_analysis(doc, df)      # 신규: 제4장 부서별 분석
     _add_chapter_risk_analysis(doc, df)
+    _add_chapter_action_analysis(doc, df)    # 신규: 제6장 조치 이행실태
     _add_chapter_repeat(doc, df)
     _add_chapter_recommendation(doc, df)
 
     filename = (
-        f"2025년_자체종합안전심사_AI분석보고서_"
+        f"{report_year}년_자체종합안전심사_AI분석보고서_"
         f"{datetime.now().strftime('%Y%m%d')}.docx"
     )
     save_path = OUTPUT_DIR / filename
     doc.save(save_path)
     logger.info(f"보고서 저장 완료: {save_path}")
     return save_path
+
+
+def _get_report_year(df: pd.DataFrame) -> int:
+    """보고서 기준 연도 — 데이터의 최신 연도, 없으면 현재 연도"""
+    try:
+        if "year" in df.columns:
+            years = pd.to_numeric(df["year"], errors="coerce").dropna()
+            if not years.empty:
+                return int(years.max())
+    except Exception:
+        pass
+    return datetime.now().year
 
 
 # ─────────────────────────────────────────
@@ -112,13 +190,13 @@ def _setup_document(doc: Document):
 # ─────────────────────────────────────────
 # 표지
 # ─────────────────────────────────────────
-def _add_cover(doc: Document):
+def _add_cover(doc: Document, report_year: int):
     for _ in range(6):
         doc.add_paragraph()
 
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run("2025년 자체종합안전심사")
+    run = p.add_run(f"{report_year}년 자체종합안전심사")
     run.font.size = Pt(24)
     run.font.bold = True
     run.font.color.rgb = RGBColor(0x1A, 0x23, 0x7E)
@@ -169,9 +247,11 @@ def _add_toc(doc: Document):
         ("제1장", "분석 개요"),
         ("제2장", "AI 분류 결과 요약"),
         ("제3장", "파트별 세부 분석"),
-        ("제4장", "리스크 등급 분석"),
-        ("제5장", "반복 지적사항 분석"),
-        ("제6장", "올해 집중 점검 권고사항"),
+        ("제4장", "부서별 분석"),
+        ("제5장", "리스크 등급 분석"),
+        ("제6장", "조치 이행실태 분석"),
+        ("제7장", "반복 지적사항 분석"),
+        ("제8장", "집중 점검 및 컨설팅 권고"),
     ]
     for num, title in toc_items:
         p = doc.add_paragraph()
@@ -305,6 +385,14 @@ def _add_chapter_classification(doc: Document, df: pd.DataFrame):
         doc.add_picture(str(chart_path), width=Inches(5.5))
         doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    # AI 분석 서술 (신규) — 표의 수치를 근거로 한 해설 문단
+    _add_heading(doc, "2.2 분석 종합", level=2)
+    stats_text = "\n".join(
+        f"- {part}: {count}건 ({count / total * 100:.1f}%)"
+        for part, count in part_counts.items()
+    ) + f"\n- 전체: {total}건"
+    _add_narrative(doc, "파트별 지적사항 분포의 의미와 시사점", stats_text)
+
     doc.add_page_break()
 
 
@@ -374,10 +462,168 @@ def _add_chapter_part_analysis(doc: Document, df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────
-# 4장: 리스크 등급 분석
+# 4장: 부서별 분석 (신규, 2026-07)
+# ─────────────────────────────────────────
+def _add_chapter_dept_analysis(doc: Document, df: pd.DataFrame):
+    _add_heading(doc, "제4장  부서별 분석", level=1)
+
+    if "department" not in df.columns:
+        doc.add_paragraph("부서 데이터가 없습니다.")
+        doc.add_page_break()
+        return
+
+    df_clean = df[
+        df["department"].notna()
+        & ~df["department"].isin(["미기재", "nan", ""])
+    ]
+
+    _add_heading(doc, "4.1 부서별 지적 현황 TOP 10", level=2)
+
+    dept_counts = df_clean["department"].value_counts().head(10)
+    table = doc.add_table(rows=len(dept_counts) + 1, cols=4)
+    table.style = "Table Grid"
+
+    for j, h in enumerate(["순위", "부서명", "지적건수", "리스크 상"]):
+        cell = table.rows[0].cells[j]
+        cell.text = h
+        _set_cell_bg(cell, "1565C0")
+
+    for i, (dept, cnt) in enumerate(dept_counts.items(), 1):
+        dept_df = df_clean[df_clean["department"] == dept]
+        high = len(dept_df[dept_df["ai_risk"] == "상"]) if "ai_risk" in dept_df.columns else 0
+        row = table.rows[i]
+        row.cells[0].text = str(i)
+        row.cells[1].text = str(dept)
+        row.cells[2].text = f"{cnt}건"
+        row.cells[3].text = f"{high}건"
+        if high > 0:
+            _set_cell_bg(row.cells[3], "FFCDD2")
+
+    _format_table(table, [1.5, 6.0, 3.0, 3.0])
+    _style_header_row(table.rows[0], white_text=True)
+
+    # AI 분석 서술
+    _add_heading(doc, "4.2 분석 종합", level=2)
+    stats_text = "\n".join(
+        f"- {dept}: {cnt}건"
+        for dept, cnt in dept_counts.items()
+    )
+    _add_narrative(doc, "부서별 지적 집중 현황과 관리 방향", stats_text)
+
+    doc.add_paragraph()
+    doc.add_page_break()
+
+
+# ─────────────────────────────────────────
+# 6장: 조치 이행실태 분석 (신규, 2026-07)
+# ─────────────────────────────────────────
+def _add_chapter_action_analysis(doc: Document, df: pd.DataFrame):
+    _add_heading(doc, "제6장  조치 이행실태 분석", level=1)
+
+    doc.add_paragraph(
+        "추진실적 기록을 자동 판정하여 지적사항의 조치 이행 수준을 분석하였다. "
+        "'형식적'은 구체적 내용 없이 완료 처리된 건으로, 실질 이행 여부의 확인이 필요하다."
+    )
+
+    if "action_status" not in df.columns:
+        doc.add_paragraph("추진실적 데이터가 없습니다.")
+        doc.add_page_break()
+        return
+
+    # ── 6.1 전체 이행 현황
+    _add_heading(doc, "6.1 전체 이행 현황", level=2)
+    s = action_summary(df)
+
+    table = doc.add_table(rows=2, cols=6)
+    table.style = "Table Grid"
+    headers = ["전체", "완료", "형식적", "진행중", "미확인", "이행률"]
+    values  = [
+        f"{s['total']}건", f"{s['완료']}건", f"{s['형식적']}건",
+        f"{s['진행중']}건", f"{s['미확인']}건", f"{s['이행률']}%",
+    ]
+    for j, h in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = h
+        _set_cell_bg(cell, "1565C0")
+    for j, v in enumerate(values):
+        table.rows[1].cells[j].text = v
+    _format_table(table, [2.5, 2.5, 2.5, 2.5, 2.5, 2.5])
+    _style_header_row(table.rows[0], white_text=True)
+
+    doc.add_paragraph()
+
+    # ── 6.2 부서별 이행률 (낮은 순)
+    _add_heading(doc, "6.2 부서별 이행률 (낮은 순)", level=2)
+    dept_rate = action_rate_by_group(df, "department")
+
+    if not dept_rate.empty:
+        show = dept_rate.head(10)
+        table2 = doc.add_table(rows=len(show) + 1, cols=5)
+        table2.style = "Table Grid"
+
+        for j, h in enumerate(["부서명", "지적건수", "완료", "형식적/미확인", "이행률"]):
+            cell = table2.rows[0].cells[j]
+            cell.text = h
+            _set_cell_bg(cell, "1565C0")
+
+        for i, (_, r) in enumerate(show.iterrows(), 1):
+            row = table2.rows[i]
+            row.cells[0].text = str(r["department"])
+            row.cells[1].text = f"{r['지적건수']}건"
+            row.cells[2].text = f"{r['완료']}건"
+            row.cells[3].text = f"{r['형식적'] + r['미확인']}건"
+            row.cells[4].text = f"{r['이행률(%)']}%"
+            # 이행률 60% 이하 강조
+            if r["이행률(%)"] <= 60:
+                for cell in row.cells:
+                    _set_cell_bg(cell, "FFCDD2")
+
+        _format_table(table2, [5.0, 2.5, 2.0, 3.0, 2.5])
+        _style_header_row(table2.rows[0], white_text=True)
+
+    doc.add_paragraph()
+
+    # ── 6.3 컨설팅 우선 대상 부서
+    _add_heading(doc, "6.3 컨설팅 우선 대상 부서", level=2)
+    doc.add_paragraph(
+        "지적 3건 이상이면서 이행률 60% 이하인 부서로, "
+        "지적 감소를 위한 컨설팅이 우선적으로 필요한 대상이다."
+    )
+    targets = consulting_targets(df)
+    if targets.empty:
+        doc.add_paragraph("해당 기준에 부합하는 부서가 없습니다.")
+    else:
+        for _, r in targets.iterrows():
+            p = doc.add_paragraph(style="List Bullet")
+            p.add_run(
+                f"{r['department']} — 지적 {r['지적건수']}건, "
+                f"이행률 {r['이행률(%)']}% "
+                f"(형식적 {r['형식적']}건, 미확인 {r['미확인']}건)"
+            )
+
+    # AI 분석 서술
+    _add_heading(doc, "6.4 분석 종합", level=2)
+    stats_text = (
+        f"- 전체 {s['total']}건 중 완료 {s['완료']}건 (이행률 {s['이행률']}%)\n"
+        f"- 형식적 완료 {s['형식적']}건, 진행중 {s['진행중']}건, 미확인 {s['미확인']}건\n"
+    )
+    if not dept_rate.empty:
+        low3 = dept_rate.head(3)
+        stats_text += "\n".join(
+            f"- 이행률 하위 부서: {r['department']} {r['이행률(%)']}% (지적 {r['지적건수']}건)"
+            for _, r in low3.iterrows()
+        )
+    _add_narrative(doc, "조치 이행실태의 수준 진단과 개선 방향", stats_text)
+
+    doc.add_paragraph()
+    doc.add_page_break()
+
+
+# ─────────────────────────────────────────
+# 5장: 리스크 등급 분석
 # ─────────────────────────────────────────
 def _add_chapter_risk_analysis(doc: Document, df: pd.DataFrame):
-    _add_heading(doc, "제4장  리스크 등급 분석", level=1)
+    _add_heading(doc, "제5장  리스크 등급 분석", level=1)
 
     if "ai_risk" not in df.columns:
         doc.add_paragraph("리스크 데이터가 없습니다.")
@@ -386,7 +632,7 @@ def _add_chapter_risk_analysis(doc: Document, df: pd.DataFrame):
 
     df_clean = df[df["ai_part"].notna() & (df["ai_part"] != "미분류")]
 
-    _add_heading(doc, "4.1 전체 리스크 등급 분포", level=2)
+    _add_heading(doc, "5.1 전체 리스크 등급 분포", level=2)
     risk_counts = df_clean["ai_risk"].value_counts()
     total_r     = len(df_clean)
 
@@ -413,7 +659,7 @@ def _add_chapter_risk_analysis(doc: Document, df: pd.DataFrame):
 
     doc.add_paragraph()
 
-    _add_heading(doc, "4.2 리스크 '상' 항목 목록 (집중 관리 필요)", level=2)
+    _add_heading(doc, "5.2 리스크 '상' 항목 목록 (집중 관리 필요)", level=2)
     df_high = df_clean[df_clean["ai_risk"] == "상"].copy()
 
     if not df_high.empty:
@@ -456,7 +702,7 @@ def _add_chapter_risk_analysis(doc: Document, df: pd.DataFrame):
 # 5장: 반복 지적사항
 # ─────────────────────────────────────────
 def _add_chapter_repeat(doc: Document, df: pd.DataFrame):
-    _add_heading(doc, "제5장  반복 지적사항 분석", level=1)
+    _add_heading(doc, "제7장  반복 지적사항 분석", level=1)
 
     doc.add_paragraph(
         "반복적으로 지적되는 사항은 구조적 문제일 가능성이 높으므로 "
@@ -511,7 +757,7 @@ def _add_chapter_repeat(doc: Document, df: pd.DataFrame):
 # 6장: 집중 점검 권고사항
 # ─────────────────────────────────────────
 def _add_chapter_recommendation(doc: Document, df: pd.DataFrame):
-    _add_heading(doc, "제6장  올해 집중 점검 권고사항", level=1)
+    _add_heading(doc, "제8장  집중 점검 및 컨설팅 권고", level=1)
 
     doc.add_paragraph(
         "AI 분석 결과를 바탕으로 올해 자체종합안전심사에서 "
@@ -533,7 +779,7 @@ def _add_chapter_recommendation(doc: Document, df: pd.DataFrame):
         if df_part.empty:
             continue
 
-        _add_heading(doc, f"6.{i} {info['icon']} {part} 파트 집중 점검 항목", level=2)
+        _add_heading(doc, f"8.{i} {info['icon']} {part} 파트 집중 점검 항목", level=2)
         doc.add_paragraph(f"● 분야: {info['desc']}")
         doc.add_paragraph(f"● 해당 건수: {len(df_part)}건")
 
@@ -557,6 +803,24 @@ def _add_chapter_recommendation(doc: Document, df: pd.DataFrame):
         for title, cnt in repeat_items.items():
             p = doc.add_paragraph(style="List Bullet")
             p.add_run(f"{title} ({cnt}회 반복)")
+
+        # AI 컨설팅 서술 (신규) — 통계 근거 기반 개선 컨설팅 방향 제시
+        doc.add_paragraph("● AI 컨설팅 의견")
+        act = action_summary(df_part) if "action_status" in df_part.columns else None
+        stats_text = f"- {part} 파트 지적 {len(df_part)}건\n"
+        if "ai_risk" in df_part.columns:
+            stats_text += f"- 리스크 상 {len(df_part[df_part['ai_risk'] == '상'])}건\n"
+        stats_text += "\n".join(
+            f"- 반복 지적: {title} ({cnt}회)"
+            for title, cnt in repeat_items.items()
+        )
+        if act:
+            stats_text += f"\n- 조치 이행률 {act['이행률']}% (형식적 {act['형식적']}건, 미확인 {act['미확인']}건)"
+        _add_narrative(
+            doc,
+            f"{part} 파트의 반복 지적 원인 추정과 지적 감소를 위한 컨설팅 방향 (컨설팅 포인트 2~3개 포함)",
+            stats_text
+        )
 
         doc.add_paragraph()
 
