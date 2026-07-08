@@ -35,7 +35,12 @@ def get_or_create_collection() -> chromadb.Collection:
     client = get_chroma_client()
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
-        metadata={"description": "DTRO 자체종합안전심사 이력"}
+        # hnsw:space="cosine" : 유사도를 코사인 방식으로 계산하도록 지정
+        # (미지정 시 기본값 L2 가 사용되어 similarity = 1 - distance 값이
+        #  큰 음수가 되는 버그가 있었음. cosine 은 distance 가 0~2 범위라
+        #  1 - distance 가 -1~1 의 의미 있는 유사도가 됨)
+        metadata={"description": "DTRO 자체종합안전심사 이력",
+                  "hnsw:space": "cosine"}
     )
     return collection
 
@@ -174,7 +179,9 @@ def build_vector_store(df: pd.DataFrame) -> bool:
 
         collection = client.create_collection(
             name=COLLECTION_NAME,
-            metadata={"description": "DTRO 자체종합안전심사 이력"}
+            # 재구축 시에도 반드시 cosine 방식으로 생성 (위 주석 참고)
+            metadata={"description": "DTRO 자체종합안전심사 이력",
+                      "hnsw:space": "cosine"}
         )
 
         logger.info(f"벡터DB 구축 시작: {len(df)}건")

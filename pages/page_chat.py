@@ -211,6 +211,28 @@ def _render_input_area(df: pd.DataFrame | None):
 
 
 # ─────────────────────────────────────────
+# 대화 이력 정제 헬퍼
+# ─────────────────────────────────────────
+def _clean_history_content(content: str) -> str:
+    """
+    이전 답변을 대화 이력으로 재전달하기 전에
+    모델이 복사하면 안 되는 장식 요소를 제거합니다.
+    - "⚠️ ..." 경고 문구 블록 (--- 이후 전체)
+    - "⚖️ **법령/규정 기반 답변**" 헤더
+    - 너무 긴 답변은 앞 300자만 (이력은 맥락 파악용이므로 충분)
+    """
+    # 경고 문구 블록 제거 (--- 구분선 이후)
+    if "\n---\n" in content:
+        content = content.split("\n---\n")[0]
+    # 법령 답변 헤더 제거
+    content = content.replace("⚖️ **법령/규정 기반 답변**", "").strip()
+    # 길이 제한
+    if len(content) > 300:
+        content = content[:300] + "..."
+    return content
+
+
+# ─────────────────────────────────────────
 # AI 응답 생성 (핵심)
 # ─────────────────────────────────────────
 def _generate_answer(question: str, df: pd.DataFrame) -> str:
@@ -234,6 +256,21 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
         ]
         is_legal_query = any(kw in question for kw in legal_keywords)
 
+        # ── 데이터 조회 의도 감지 (2026-07 추가) ──
+        # [문제 사례] "전체기록에서 철도종사자안전교육 내역을 뽑아줘"
+        #   → "교육" 단어 때문에 법령 질문으로 오분류되어
+        #     심사이력 데이터를 전혀 보지 않고 법령PDF만 검색 → 오답
+        # [해결] 아래 단어가 있으면 "심사이력 데이터 조회" 의도로 판단하고
+        #   법령 전용 답변 경로를 건너뜀 (데이터 경로에서도 법령은
+        #   보조 컨텍스트로 함께 검색되므로 정보 손실 없음)
+        data_keywords = [
+            "내역", "목록", "리스트", "뽑아", "추출", "검색해",
+            "건수", "몇 건", "몇건", "기록", "이력", "현황",
+            "지적사항", "지적된", "지적받은", "지적은",
+            "전체", "모두", "알려줘", "보여줘", "분석해",
+        ]
+        is_data_query = any(kw in question for kw in data_keywords)
+
         # ── 법령 우선 검색 (핵심 변경) ──
         # 기존: is_legal_query 일 때만 법령DB 검색
         # 변경: 법령DB 가 있으면 항상 검색하고,
@@ -244,14 +281,19 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
             # top_k=5 로 충분히 검색 (기존 2 → 5 로 증가)
             legal_results = search_legal(question, top_k=5)
 
-            # 유사도 0.5 이상 결과가 있으면 법령 우선 답변
-            # (0.5 미만은 관련성 낮은 것으로 판단)
+            # 유사도 0.45 이상 결과가 있으면 법령 우선 답변
+            # ※ 코사인 유사도 기준 (legal_store 가 cosine 으로 재구축된 후 유효)
+            #   nomic-embed-text 는 한국어에서 유사 문서도 0.45~0.6 정도로
+            #   나오는 경우가 많아 0.5 보다 약간 완화함.
+            #   너무 낮추면 무관한 문서가 잡히므로 0.4 미만으로는 내리지 말 것
             high_sim_results = [
                 r for r in legal_results
-                if r.get("similarity", 0) >= 0.5
+                if r.get("similarity", 0) >= 0.45
             ]
 
-            if high_sim_results or is_legal_query:
+            # 데이터 조회 의도가 있으면 법령 전용 답변으로 빠지지 않음
+            # (아래 데이터 경로에서 법령을 보조 컨텍스트로 함께 사용)
+            if (high_sim_results or is_legal_query) and not is_data_query:
                 with st.spinner("법령/규정 검색 중..."):
                     legal_answer = quick_legal_search(question, top_k=5)
 
@@ -296,9 +338,16 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
                     + "\n".join(legal_parts)
                 )
 
-        history  = st.session_state.get("chat_messages", [])[:-1][-5:]
+        # ── 대화 이력 전달 (반복답변 버그 수정, 2026-07) ──
+        # [변경 1] 최근 5턴 → 최근 2턴으로 축소
+        #   8b급 소형 모델은 이력이 길수록 새 질문 대신
+        #   과거 답변을 복사하는 경향이 강해짐
+        # [변경 2] AI 답변에서 경고문(⚠️)·헤더(⚖️)를 제거하고 전달
+        #   경고문까지 이력으로 들어가면 모델이 그 문구까지
+        #   그대로 복사해서 출력하는 문제가 있었음
+        history  = st.session_state.get("chat_messages", [])[:-1][-2:]
         messages = [
-            {"role": h["role"], "content": h["content"]}
+            {"role": h["role"], "content": _clean_history_content(h["content"])}
             for h in history
         ]
 
@@ -314,7 +363,11 @@ def _generate_answer(question: str, df: pd.DataFrame) -> str:
 4. 표나 목록 형식으로 가독성을 높입니다
 5. 법령 근거가 있으면 반드시 인용합니다
 6. 법령/규정 자료에 명시된 내용과 AI 일반 지식이 다를 경우
-   반드시 법령/규정 자료의 내용을 우선합니다"""
+   반드시 법령/규정 자료의 내용을 우선합니다
+7. 이전 대화의 답변을 절대 복사하지 않습니다.
+   반드시 마지막 질문에 대해서만 새로 답변합니다
+8. 질문에 해당하는 데이터가 [현재 데이터 현황]에 없으면
+   "해당 데이터를 찾을 수 없습니다"라고만 답변합니다"""
 
         # ── 경고 문구 추가 ──
         # 법령DB 에서 근거를 찾지 못한 경우
@@ -411,9 +464,100 @@ def _build_data_context(question: str, df: pd.DataFrame) -> str:
 # ─────────────────────────────────────────
 # 질문 키워드 기반 데이터 추출
 # ─────────────────────────────────────────
+# 자유 키워드 추출 시 무시할 조사·일반 단어
+_STOPWORDS = {
+    "전체", "기록", "기록에서", "내역", "내역을", "목록", "리스트",
+    "뽑아줘", "뽑아", "추출", "추출해줘", "알려줘", "보여줘", "검색해줘",
+    "대한", "대해", "관련", "관한", "있는", "해당", "모두", "모든",
+    "건수", "현황", "분석해줘", "분석", "심사", "지적사항", "지적",
+    "무엇", "어떤", "어디", "얼마나",
+}
+
+
+def _search_by_free_keywords(question: str, df: pd.DataFrame) -> str:
+    """
+    질문 속 자유 키워드로 제목·현황및문제점 컬럼을 직접 검색합니다 (2026-07 추가)
+
+    [문제 배경]
+    기존 로직은 부서명/파트명/반복/리스크 같은 정해진 패턴만 인식해서
+    "철도종사자안전교육 내역 뽑아줘" 처럼 제목 키워드로 묻는 질문에는
+    관련 데이터를 전혀 찾지 못했음
+
+    [동작 방식]
+    1. 질문을 공백으로 쪼개고 조사를 제거한 뒤 2글자 이상 단어만 추출
+    2. 불용어(뽑아줘, 내역 등 일반 단어) 제외
+    3. 각 단어가 제목(title) 또는 현황및문제점(problem)에 포함된 행 검색
+    4. 찾은 행의 핵심 정보(제목/부서/년도/심사구분)를 컨텍스트로 반환
+    """
+    if df is None or df.empty:
+        return ""
+
+    # ── 1. 질문에서 후보 키워드 추출 ──
+    tokens = []
+    for raw in question.replace(",", " ").split():
+        # 흔한 조사 제거 (에서/에게/으로/의/을/를/은/는/이/가/도/와/과/에)
+        word = raw
+        for josa in ("에서", "에게", "으로", "이라", "라고",
+                     "의", "을", "를", "은", "는", "이", "가", "도", "와", "과", "에"):
+            if word.endswith(josa) and len(word) > len(josa) + 1:
+                word = word[: -len(josa)]
+                break
+        word = word.strip()
+        if len(word) >= 2 and word not in _STOPWORDS:
+            tokens.append(word)
+
+    if not tokens:
+        return ""
+
+    # ── 2. 제목/문제점 컬럼에서 키워드 포함 행 검색 ──
+    title_col   = "title"   if "title"   in df.columns else None
+    problem_col = "problem" if "problem" in df.columns else None
+    if not title_col:
+        return ""
+
+    mask = pd.Series(False, index=df.index)
+    matched_tokens = []
+    for tok in tokens:
+        tok_mask = df[title_col].str.contains(tok, na=False, regex=False)
+        if problem_col:
+            tok_mask |= df[problem_col].str.contains(tok, na=False, regex=False)
+        if tok_mask.any():
+            mask |= tok_mask
+            matched_tokens.append(tok)
+
+    if not mask.any():
+        return ""
+
+    hits = df[mask].head(10)  # 프롬프트 길이 보호를 위해 최대 10건
+
+    # ── 3. 컨텍스트 문자열 구성 ──
+    lines = [f"키워드({', '.join(matched_tokens)}) 검색 결과 {int(mask.sum())}건:"]
+    for _, row in hits.iterrows():
+        parts = [f"제목: {row.get(title_col, '')}"]
+        if "department" in df.columns and pd.notna(row.get("department")):
+            parts.append(f"부서: {row['department']}")
+        if "year" in df.columns and pd.notna(row.get("year")):
+            parts.append(f"년도: {row['year']}")
+        if "audit_type" in df.columns and pd.notna(row.get("audit_type")):
+            parts.append(f"구분: {row['audit_type']}")
+        if "ai_part" in df.columns and pd.notna(row.get("ai_part")):
+            parts.append(f"파트: {row['ai_part']}")
+        lines.append("  - " + " / ".join(parts))
+        # 문제점 내용도 요약 제공 (있을 때만, 150자 제한)
+        if problem_col and pd.notna(row.get(problem_col)) and str(row.get(problem_col)).strip():
+            lines.append(f"    문제점: {str(row[problem_col])[:150]}")
+
+    return "\n".join(lines)
+
+
 def _extract_relevant_data(question: str, df: pd.DataFrame) -> str:
     """질문에서 키워드를 감지하고 관련 데이터를 추출"""
     result_parts = []
+
+    # ── 자유 키워드 제목/내용 검색 (가장 먼저 실행, 2026-07 추가) ──
+    free_search = _search_by_free_keywords(question, df)
+    if free_search:
+        result_parts.append(free_search)
 
     # 부서명 감지
     if "department" in df.columns:

@@ -3,6 +3,7 @@
 # PDF 파싱 → 청크 분할 → 임베딩 → ChromaDB 저장
 
 import logging
+import re
 from pathlib import Path
 
 import chromadb
@@ -17,6 +18,7 @@ from config.settings import (
     LEGAL_CHUNK_SIZE,
     LEGAL_CHUNK_OVERLAP,
     LEGAL_TOP_K,
+    LEGAL_SYNONYMS,
     EMBEDDING_MODEL,
 )
 from core.embedder import get_embedding
@@ -41,7 +43,9 @@ def get_legal_collection() -> chromadb.Collection:
     client = get_legal_client()
     return client.get_or_create_collection(
         name=LEGAL_COLLECTION,
-        metadata={"description": "DTRO 법령/규정 문서"}
+        # hnsw:space="cosine" : L2 기본값 버그 수정 — 코사인 유사도 사용
+        metadata={"description": "DTRO 법령/규정 문서",
+                  "hnsw:space": "cosine"}
     )
 
 
@@ -65,27 +69,93 @@ def extract_pdf_text(pdf_path: Path) -> str:
 # ─────────────────────────────────────────
 # 텍스트 청크 분할
 # ─────────────────────────────────────────
+# 조항 시작을 나타내는 패턴들
+# 예) "제16장", "제5조", "6.4 사용중인...", "3.1.2 ..."
+#     이런 지점에서 청크를 끊어야 "6.4 조항 전체" 가
+#     하나의 청크에 온전히 들어가 검색 정확도가 올라감
+_CLAUSE_PATTERN = re.compile(
+    r"(?=\n\s*(?:"
+    r"제\s*\d+\s*[장조절항]"      # 제16장, 제5조, 제2절, 제3항
+    r"|\d{1,2}(?:\.\d{1,2}){1,3}\s"  # 6.4 / 3.1.2 뒤에 공백
+    r"|[①-⑳]"                      # 원문자 항목
+    r"))"
+)
+
+
 def split_into_chunks(
     text: str,
     chunk_size: int = LEGAL_CHUNK_SIZE,
     overlap:    int = LEGAL_CHUNK_OVERLAP
 ) -> list[str]:
     """
-    텍스트를 일정 크기의 청크로 분할
-    overlap: 청크 간 겹치는 부분 (문맥 유지)
-    """
-    chunks = []
-    start  = 0
-    length = len(text)
+    텍스트를 청크로 분할 — 조항 경계 우선 방식 (개선, 2026-07)
 
-    while start < length:
-        end   = min(start + chunk_size, length)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start += chunk_size - overlap
+    [기존 방식의 문제]
+    500자마다 기계적으로 잘라서 "6.4 ..." 같은 조항이
+    두 청크에 걸쳐 잘리거나, 무관한 조항들과 섞여
+    임베딩 벡터가 희석되는 문제가 있었음 (MSDS 오답의 원인 중 하나)
+
+    [개선 방식]
+    1. 먼저 조항 번호 패턴(제N장/제N조/6.4 등)에서 텍스트를 분할
+    2. 조항 하나가 chunk_size 이내면 그대로 하나의 청크로 사용
+       → 조항 전체가 온전히 한 청크에 들어감
+    3. 조항이 너무 길면 그 안에서만 기존 글자수 방식으로 세분화
+    4. 너무 짧은 조각은 다음 조각과 합쳐 검색 노이즈 감소
+    """
+    # ── 1단계: 조항 경계로 1차 분할 ──
+    sections = _CLAUSE_PATTERN.split(text)
+    sections = [s.strip() for s in sections if s and s.strip()]
+
+    # 조항 패턴이 하나도 없으면(일반 문서) 전체를 한 섹션으로
+    if not sections:
+        sections = [text.strip()]
+
+    # ── 2단계: 짧은 조각은 앞 조각과 병합 (최소 80자) ──
+    merged: list[str] = []
+    for sec in sections:
+        if merged and len(merged[-1]) < 80:
+            merged[-1] = merged[-1] + "\n" + sec
+        else:
+            merged.append(sec)
+
+    # ── 3단계: 긴 조항만 글자수 방식으로 세분화 ──
+    chunks: list[str] = []
+    for sec in merged:
+        if len(sec) <= chunk_size:
+            chunks.append(sec)
+        else:
+            start, length = 0, len(sec)
+            while start < length:
+                end   = min(start + chunk_size, length)
+                piece = sec[start:end].strip()
+                if piece:
+                    chunks.append(piece)
+                start += chunk_size - overlap
 
     return chunks
+
+
+def _expand_query(query_text: str) -> str:
+    """
+    검색 질의에 동의어를 자동으로 덧붙입니다 (신규, 2026-07)
+
+    예) "MSDS 갱신주기가 몇 년이야?"
+        → "MSDS 갱신주기가 몇 년이야? (물질안전보건자료, 갱신, 개정, 현행화)"
+
+    이렇게 하면 지침서 원문이 "물질안전보건자료" 로만 적혀 있어도
+    임베딩 검색에서 해당 조항이 상위에 올라올 확률이 크게 높아집니다.
+    동의어 사전은 config/settings.py 의 LEGAL_SYNONYMS 에서 관리합니다.
+    """
+    extra: list[str] = []
+    for term, synonyms in LEGAL_SYNONYMS.items():
+        if term in query_text:
+            for s in synonyms:
+                if s not in query_text and s not in extra:
+                    extra.append(s)
+
+    if extra:
+        return f"{query_text} ({', '.join(extra)})"
+    return query_text
 
 
 # ─────────────────────────────────────────
@@ -108,7 +178,9 @@ def build_legal_store(
 
     collection = client.create_collection(
         name=LEGAL_COLLECTION,
-        metadata={"description": "DTRO 법령/규정 문서"}
+        # hnsw:space="cosine" : L2 기본값 버그 수정 — 코사인 유사도 사용
+        metadata={"description": "DTRO 법령/규정 문서",
+                  "hnsw:space": "cosine"}
     )
 
     # 전체 PDF 파일 수집
@@ -218,7 +290,10 @@ def search_legal(
         if collection.count() == 0:
             return []
 
-        query_embedding = get_embedding(query_text)
+        # 동의어 확장: "MSDS" → "MSDS (물질안전보건자료...)" 형태로
+        # 질의를 보강해서 용어 불일치로 인한 검색 실패를 방지
+        expanded_query  = _expand_query(query_text)
+        query_embedding = get_embedding(expanded_query)
         if not query_embedding:
             return []
 

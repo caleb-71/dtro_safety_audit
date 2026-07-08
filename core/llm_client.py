@@ -24,6 +24,7 @@
 
 import json
 import logging
+import uuid
 
 from config.settings import (
     OLLAMA_MODE,
@@ -114,12 +115,21 @@ def _network_chat(model, messages, options) -> dict:
 
     # 주의: 호출부가 넘기는 model 은 로컬용 상수(OLLAMA_MODEL)이므로
     # network 모드에서는 항상 서버 설정(NETWORK_LLM_MODEL)을 사용한다.
+    # ── 세션 ID 를 요청마다 고유하게 생성 (반복답변 버그 수정, 2026-07) ──
+    # [문제] 고정 세션("dtro_audit")을 쓰면 사내망 서버가 세션별로
+    #   자체 대화기록을 계속 누적함 → 클라이언트가 보내는 이력과 이중으로
+    #   쌓여서, 새 질문에도 과거 답변(MSDS 등)을 그대로 복사해 응답하는
+    #   심각한 반복답변 현상이 발생했음
+    # [해결] 대화 맥락은 page_chat.py 가 직접 관리하므로
+    #   서버 세션은 매 요청마다 새로 만들어 서버측 기억을 차단함
+    unique_session = f"{NETWORK_LLM_SESSION}_{uuid.uuid4().hex[:8]}"
+
     payload = {
         "model":   NETWORK_LLM_MODEL,
         "prompt":  _messages_to_prompt(messages or []),
         "stream":  "true",                    # 서버 백엔드가 스트리밍 전용
         "num_ctx": str(NETWORK_LLM_NUM_CTX),  # 문자열 전송이 안전 (@RequestParam)
-        "session": NETWORK_LLM_SESSION,
+        "session": unique_session,
     }
 
     parts: list[str] = []
@@ -162,9 +172,16 @@ def _messages_to_prompt(messages: list) -> str:
         # 단일 질문이면 역할 표기 없이 그대로 (분류·법령 프롬프트 등 대부분의 경우)
         lines.append(dialog[0]["content"])
     else:
-        for m in dialog:
+        # 이전 대화가 있는 경우 — 모델이 과거 답변을 그대로 복사하지 않도록
+        # 명시적으로 지시 (8b급 소형 모델은 이 지시가 없으면
+        # 이력 마지막 답변을 반복하는 경향이 강함)
+        lines.append("[이전 대화 — 맥락 참고용이며, 아래 마지막 질문에만 새로 답변할 것]")
+        for m in dialog[:-1]:
             role = "사용자" if m.get("role") == "user" else "AI"
             lines.append(f"{role}: {m['content']}")
+        lines.append("")
+        lines.append("[마지막 질문 — 이 질문에만 답변하세요. 이전 답변을 복사하지 마세요]")
+        lines.append(f"사용자: {dialog[-1]['content']}")
         lines.append("AI:")
 
     return "\n".join(lines)
