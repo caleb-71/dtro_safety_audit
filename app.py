@@ -34,7 +34,8 @@ with st.sidebar:
             "💬 AI 질의응답",
             "📋 현장 심사 도우미",
             "⚖️ 법령/규정 관리",
-            "🏢 부서별 심사 조회",   # ← 신규
+            "🏢 부서별 심사 조회",
+            "📋 심사계획 수립",   # ← 신규 (2026-07)
         ],
         label_visibility="collapsed"
     )
@@ -91,6 +92,10 @@ elif menu == "⚖️ 법령/규정 관리":
     from pages.page_legal import render
     render()
 
-elif menu == "🏢 부서별 심사 조회":   # ← 신규
+elif menu == "🏢 부서별 심사 조회":
     from pages.page_dept import render
+    render()
+
+elif menu == "📋 심사계획 수립":   # ← 신규 (2026-07)
+    from pages.page_plan import render
     render()
